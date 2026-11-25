@@ -1,0 +1,300 @@
+rules:
+  # ==================================================================
+  # Android biometric / KeyStore rules for JADX-decompiled APKs.
+  #
+  # TARGET: these rules run over the Java that jadx produces from an
+  # APK (`jadx -d out app.apk`, then scan `out/sources`). They are not
+  # written for Kotlin source — on a real source tree the receiver
+  # types and call shapes differ.
+  #
+  # SCOPING (read this before complaining about noise): a decompiled
+  # APK bundles the whole dependency tree (androidx, kotlin, Play
+  # Services, Tink, OkHttp, …). Those libraries contain the same APIs
+  # these rules match, but they are not the app's own flow. Scope the
+  # scan instead of baking a package denylist into every rule:
+  #
+  #   # only the app's own code
+  #   semgrep --config biometric-rules.yml --include 'ar/com/yourbank/**' out/sources
+  #
+  #   # or drop a .semgrepignore next to the scan with the framework roots:
+  #   #   androidx/ kotlin/ kotlinx/ com/google/ okhttp3/ okio/ org/bouncycastle/
+  #
+  # Keeping the denylist out of the rules makes them portable and
+  # honest: the rule says what is risky, the analyst decides what is
+  # in scope. Triage the hits — a KeyStore key in a vendored business
+  # SDK may still matter; one in a framework almost never does.
+  # ==================================================================
+
+  # ------------------------------------------------------------------
+  # R1 — Key usable WITHOUT user authentication.
+  #      setUserAuthenticationRequired(false) means the key operation is
+  #      never held pending; a Cipher/Signature built from it is not
+  #      gated by the biometric prompt, so the CryptoObject is
+  #      decorative and the flow is bypassable.
+  # ------------------------------------------------------------------
+  - id: biometric-key-auth-not-required
+    languages: [java]
+    severity: HIGH
+    message: >
+      Key generated with setUserAuthenticationRequired(false). The key can be
+      used without any user authentication, so a Cipher/Signature built from it
+      is never gated by the biometric prompt. The CryptoObject becomes
+      decorative and the flow is bypassable. Set it to true (MASTG-BEST-0036).
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-287: Improper Authentication"
+      owasp:
+        - MASVS-AUTH
+      confidence: HIGH
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern: $B.setUserAuthenticationRequired(false)
+
+  # ------------------------------------------------------------------
+  # R2 — AndroidKeyStore key built but user authentication never set.
+  #      Finds a KeyGenParameterSpec.Builder whose enclosing method never
+  #      calls setUserAuthenticationRequired(...), in any of the three
+  #      shapes the same code is written:
+  #        A) fluent, one call:   new Builder(..).setKeySize(..).build()
+  #        B) fluent, many calls: new Builder(..).a().b().c().build()
+  #        C) split across statements: Builder b = new Builder(..); b.x(); b.build();
+  #      Asymmetric key-pairs / attestation keys (certificate or
+  #      attestation-challenge setters) are suppressed as non-biometric.
+  # ------------------------------------------------------------------
+  - id: biometric-key-auth-flag-absent
+    languages: [java]
+    severity: INFO
+    message: >
+      Inventory: a KeyGenParameterSpec.Builder is created in a method that never
+      calls setUserAuthenticationRequired(...), so this AndroidKeyStore key is
+      usable without user authentication. This is not necessarily a flaw — many
+      keys (at-rest encryption, device identifiers, attestation) are meant to be
+      used without a prompt. Review whether THIS key is supposed to back a
+      biometric flow; if so, add setUserAuthenticationRequired(true)
+      (MASTG-BEST-0036).
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-522: Insufficiently Protected Credentials"
+      owasp:
+        - MASVS-AUTH
+      confidence: LOW
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern: new KeyGenParameterSpec.Builder(...)
+      - pattern-not-inside: |
+          $RET $FUNC(...) {
+            ...
+            $B.setUserAuthenticationRequired(...);
+            ...
+          }
+      - pattern-not-inside: |
+          $RET $FUNC(...) {
+            ...
+            $B.setCertificateSubject(...);
+            ...
+          }
+      - pattern-not-inside: |
+          $RET $FUNC(...) {
+            ...
+            $B.setAttestationChallenge(...);
+            ...
+          }
+
+  # ------------------------------------------------------------------
+  # R3 — Event-bound: authenticate() with NO CryptoObject.
+  #      The two BiometricPrompt APIs have different signatures, so a
+  #      single pattern misses one of them:
+  #        * androidx.biometric.BiometricPrompt
+  #            no-crypto: authenticate(promptInfo)                  [1 arg]
+  #            crypto   : authenticate(promptInfo, cryptoObject)    [2 args]
+  #        * android.hardware.biometrics.BiometricPrompt (native)
+  #            no-crypto: authenticate(cancel, executor, callback)         [3 args]
+  #            crypto   : authenticate(crypto, cancel, executor, callback) [4 args]
+  #      We match both APIs and exclude the crypto overloads. The third
+  #      pattern (native prompt built inline, e.g. `builder.build()
+  #      .authenticate(...)`) is intentionally untyped: jadx does not
+  #      give semgrep enough type information to resolve the inline
+  #      receiver/callback, so a typed anchor would silently drop the
+  #      finding. The 3-argument shape is characteristic of BiometricPrompt;
+  #      triage if an unrelated build().authenticate(a, b, c) appears.
+  # ------------------------------------------------------------------
+  - id: biometric-authenticate-without-cryptoobject
+    languages: [java]
+    severity: HIGH
+    message: >
+      BiometricPrompt.authenticate() called without a CryptoObject (event-bound).
+      Success is only a callback with no cryptographic operation behind it, so a
+      Frida hook that forces onAuthenticationSucceeded bypasses it. Pass a
+      CryptoObject and consume its result (MASTG-BEST-0036).
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-287: Improper Authentication"
+      owasp:
+        - MASVS-AUTH
+      confidence: MEDIUM
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern-either:
+          # androidx: no-crypto is the 1-arg form
+          - pattern: (androidx.biometric.BiometricPrompt $BP).authenticate($INFO)
+          # native: no-crypto is the 3-arg form (cancel, executor, callback)
+          - pattern: (android.hardware.biometrics.BiometricPrompt $BP).authenticate($CANCEL, $EXEC, $CB)
+          # native prompt built inline and used without storing the instance
+          - pattern: $BUILDER.build().authenticate($CANCEL, $EXEC, $CB)
+      # exclude the crypto overloads of each API
+      - pattern-not: $BP.authenticate($INFO, $CRYPTO)
+      - pattern-not: $BP.authenticate($CRYPTO, $CANCEL, $EXEC, $CB)
+      - pattern-not: $BUILDER.build().authenticate($CRYPTO, $CANCEL, $EXEC, $CB)
+
+  # ------------------------------------------------------------------
+  # R4 — Weak authenticator or device-credential fallback.
+  #      Only BIOMETRIC_STRONG (Class 3) can be combined with a
+  #      CryptoObject. In decompiled APKs the Authenticators constants
+  #      are inlined to integers, so matching the symbolic names alone
+  #      finds nothing — we also match the integer bitmask:
+  #        BIOMETRIC_STRONG   = 0x000F = 15
+  #        BIOMETRIC_WEAK     = 0x00FF = 255
+  #        DEVICE_CREDENTIAL  = 0x8000 = 32768
+  #      Risk when the DEVICE_CREDENTIAL bit is set, or the low byte is
+  #      0xFF (weak). A literal 15 (strong only) is fine. A value passed
+  #      as a variable cannot be evaluated statically and is not flagged.
+  # ------------------------------------------------------------------
+  - id: biometric-weak-authenticator
+    languages: [java]
+    severity: MEDIUM
+    message: >
+      setAllowedAuthenticators permits BIOMETRIC_WEAK or DEVICE_CREDENTIAL. Only
+      BIOMETRIC_STRONG (Class 3) can be combined with a cryptographic operation;
+      a weak authenticator or device-credential fallback breaks the crypto
+      binding. Use BIOMETRIC_STRONG for sensitive operations.
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-287: Improper Authentication"
+      owasp:
+        - MASVS-AUTH
+      confidence: MEDIUM
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern-either:
+          # symbolic form (source / non-inlined builds)
+          - pattern: $B.setAllowedAuthenticators(<... BiometricManager.Authenticators.BIOMETRIC_WEAK ...>)
+          - pattern: $B.setAllowedAuthenticators(<... BiometricManager.Authenticators.DEVICE_CREDENTIAL ...>)
+          # integer-inlined form (decompiled APKs)
+          - patterns:
+              - pattern: $B.setAllowedAuthenticators($N)
+              - metavariable-comparison:
+                  metavariable: $N
+                  comparison: ($N & 32768) == 32768 or ($N & 255) == 255
+                  # 32768 = DEVICE_CREDENTIAL bit set; low byte 0xFF = BIOMETRIC_WEAK
+
+  # ------------------------------------------------------------------
+  # R5 — Deprecated FingerprintManager API (call on an instance).
+  #      Predates the modern BiometricPrompt crypto binding and shows no
+  #      system dialog. androidx.core's FingerprintManagerCompat wraps
+  #      this API by design, so scope it out (see the scoping note at the
+  #      top) rather than treating the wrapper as a finding.
+  # ------------------------------------------------------------------
+  - id: biometric-deprecated-fingerprintmanager
+    languages: [java]
+    severity: LOW
+    message: >
+      Use of the deprecated android.hardware.fingerprint.FingerprintManager.
+      It has no system dialog and predates the modern BiometricPrompt crypto
+      binding. Migrate to androidx.biometric.BiometricPrompt.
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-477: Use of Obsolete Function"
+      owasp:
+        - MASVS-AUTH
+      confidence: MEDIUM
+      references:
+        - https://developer.android.com/reference/androidx/biometric/BiometricPrompt
+    patterns:
+      - pattern: (android.hardware.fingerprint.FingerprintManager $FM).authenticate(...)
+
+  # ------------------------------------------------------------------
+  # R6 — Time-bound auth window instead of per-operation binding.
+  #      Two APIs set the same thing; a positive timeout in either means
+  #      that after ONE authentication the key stays usable for that many
+  #      seconds WITHOUT re-authenticating (time-based, any device
+  #      credential counts) rather than bound to a CryptoObject:
+  #        * setUserAuthenticationValidityDurationSeconds(N)  (deprecated, API <30)
+  #        * setUserAuthenticationParameters(timeout, type)   (API 30+)
+  #      For a per-use biometric binding, pass -1 / timeout 0, or use
+  #      setUserAuthenticationParameters with AUTH_BIOMETRIC_STRONG.
+  #      Only literal timeouts are evaluated; a variable is not flagged.
+  # ------------------------------------------------------------------
+  - id: biometric-auth-validity-time-window
+    languages: [java]
+    severity: MEDIUM
+    message: >
+      The key's authentication is time-bound (positive validity-duration /
+      parameters timeout), so after a single authentication it stays usable for
+      that window without re-authenticating, instead of requiring auth for every
+      operation. This weakens the crypto binding. Use a per-use binding (-1 /
+      timeout 0) with AUTH_BIOMETRIC_STRONG (MASTG-BEST-0036).
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-287: Improper Authentication"
+      owasp:
+        - MASVS-AUTH
+      confidence: MEDIUM
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: $B.setUserAuthenticationValidityDurationSeconds($N)
+              - metavariable-comparison:
+                  metavariable: $N
+                  comparison: $N > 0
+          - patterns:
+              - pattern: $B.setUserAuthenticationParameters($N, $TYPE)
+              - metavariable-comparison:
+                  metavariable: $N
+                  comparison: $N > 0
+
+  # ------------------------------------------------------------------
+  # R7 — Key survives new biometric enrollment.
+  #      setInvalidatedByBiometricEnrollment(false) keeps the key valid
+  #      even after a new fingerprint/face is enrolled on the device. An
+  #      attacker who can enrol their own biometric could then use the
+  #      existing key. It should be true (the default) for keys that gate
+  #      sensitive operations.
+  # ------------------------------------------------------------------
+  - id: biometric-not-invalidated-on-enrollment
+    languages: [java]
+    severity: MEDIUM
+    message: >
+      setInvalidatedByBiometricEnrollment(false) keeps the key usable even after
+      a new biometric is enrolled on the device. Someone who enrols their own
+      fingerprint/face could then use the existing key. Set it to true for keys
+      that back sensitive operations (MASTG-BEST-0036).
+    metadata:
+      category: security
+      technology: [android]
+      cwe:
+        - "CWE-287: Improper Authentication"
+      owasp:
+        - MASVS-AUTH
+      confidence: HIGH
+      references:
+        - https://mas.owasp.org/MASTG/best-practices/MASTG-BEST-0036/
+    patterns:
+      - pattern: $B.setInvalidatedByBiometricEnrollment(false)
