@@ -113,7 +113,17 @@ Output format: `[tag] [what was found in the code] --> plain-language verdict`
 [!] [VulnerableActivity$1.onAuthenticationSucceeded] --> CryptoObject present but never used, decorative crypto, bypassable
 ```
 
+![Frida probe detecting decorative crypto at runtime](docs/frida-probe.gif)
+
 `[+]` expected/secure  ·  `[!]` finding/insecure  ·  `[*]` info.
+
+---
+
+## Test target
+
+The toolkit includes a sample app ([biometric-binding-demo](https://github.com/FelipeRaczkowski/biometric-binding-demo))
+with both flows side by side, so you can run the Semgrep rules and the Frida probe
+against it and watch Semgrep flag the insecure path and not the secure one.
 
 ---
 
@@ -164,7 +174,5 @@ Every rule and hook maps to **OWASP MASVS-AUTH** and **MASTG-BEST-0036**
 This probe is diagnostic: it reports whether a biometric flow is cryptographically
 bound or bypassable, with evidence. It does not ship an exploit. Actively forcing
 `onAuthenticationSucceeded` to walk through an event-bound flow is trivial and
-already well documented, and is intentionally left out here — the detection above
-is the point, and the finding stands on its own without a push-button bypass. Use
-the toolkit only against apps you are authorised to test (your own apps, a
-sanctioned engagement, or intentionally vulnerable training targets).
+already well documented, and is intentionally left out here. The detection above
+is the point and the finding stands on its own without a push-button bypass.
